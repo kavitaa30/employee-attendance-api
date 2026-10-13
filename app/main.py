@@ -369,6 +369,70 @@ def build_department_summary_pipeline(month: str, department: Optional[str] = No
     return pipeline
 
 
+def build_late_leaderboard_pipeline(
+    month: str, limit: int = 10, department: Optional[str] = None
+) -> list:
+    year, m = map(int, month.split("-"))
+    start_date = f"{year:04d}-{m:02d}-01"
+    if m == 12:
+        end_date = f"{year + 1:04d}-01-01"
+    else:
+        end_date = f"{year:04d}-{m + 1:02d}-01"
+
+    pipeline = [
+        {"$match": {"date": {"$gte": start_date, "$lt": end_date}}},
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                "late_count": {
+                    "$sum": {
+                        "$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]
+                    }
+                },
+            }
+        },
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "_id",
+                "foreignField": "emp_code",
+                "as": "emp",
+            }
+        },
+        {"$unwind": "$emp"},
+    ]
+
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})
+
+    pipeline.extend(
+        [
+            {
+                "$setWindowFields": {
+                    "sortBy": {"total_late_minutes": -1},
+                    "output": {"rank": {"$rank": {}}},
+                }
+            },
+            {"$match": {"rank": {"$lte": limit}}},
+            {"$sort": {"total_late_minutes": -1, "_id": 1}},
+            {
+                "$project": {
+                    "_id": 0,
+                    "rank": 1,
+                    "emp_code": "$_id",
+                    "name": "$emp.name",
+                    "department": "$emp.department",
+                    "total_late_minutes": 1,
+                    "late_count": 1,
+                }
+            },
+        ]
+    )
+    return pipeline
+
+
 def format_employee(doc: dict) -> dict:
     d = dict(doc)
     d.pop("_id", None)
@@ -890,9 +954,33 @@ def get_department_summary(
     return {"month": month, "items": items}
 
 
+@app.get("/analytics/leaderboard/late", status_code=200)
+def get_late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    if not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month):
+        raise HTTPException(status_code=422, detail="Invalid month format")
+
+    pipeline = build_late_leaderboard_pipeline(month, limit, department)
+    cursor = db.attendance_logs.aggregate(pipeline)
+    items = [
+        {
+            "rank": int(doc["rank"]),
+            "emp_code": str(doc["emp_code"]),
+            "name": str(doc["name"]),
+            "department": str(doc["department"]),
+            "total_late_minutes": int(doc["total_late_minutes"]),
+            "late_count": int(doc["late_count"]),
+        }
+        for doc in cursor
+    ]
+    return {"month": month, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
