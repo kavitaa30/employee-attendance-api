@@ -13,9 +13,11 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
+import json
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, model_validator
@@ -144,6 +146,45 @@ def compute_working_days(month_str: str, joined_on_str: Optional[str]) -> int:
             working_days += 1
         cur += timedelta(days=1)
     return working_days
+
+
+def build_attendance_list_query(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[dict, list, int, int]:
+    if date_from is not None:
+        try:
+            datetime.strptime(date_from, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid date_from format")
+    if date_to is not None:
+        try:
+            datetime.strptime(date_to, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid date_to format")
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(status_code=422, detail="date_from cannot be greater than date_to")
+
+    q = {}
+    if emp_code is not None:
+        q["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        q["date"] = {}
+        if date_from is not None:
+            q["date"]["$gte"] = date_from
+        if date_to is not None:
+            q["date"]["$lte"] = date_to
+    if status is not None:
+        q["status"] = status
+
+    sort = [("date", -1), ("emp_code", 1)]
+    skip = (page - 1) * page_size
+    limit = page_size
+    return q, sort, skip, limit
 
 
 def build_employee_monthly_pipeline(emp_code: str, month: str) -> list:
@@ -1000,38 +1041,22 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
-    if date_from is not None:
-        try:
-            datetime.strptime(date_from, "%Y-%m-%d")
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Invalid date_from format")
-    if date_to is not None:
-        try:
-            datetime.strptime(date_to, "%Y-%m-%d")
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Invalid date_to format")
-    if date_from is not None and date_to is not None and date_from > date_to:
-        raise HTTPException(status_code=422, detail="date_from cannot be greater than date_to")
-
-    q = {}
-    if emp_code is not None:
-        q["emp_code"] = emp_code
-    if date_from is not None or date_to is not None:
-        q["date"] = {}
-        if date_from is not None:
-            q["date"]["$gte"] = date_from
-        if date_to is not None:
-            q["date"]["$lte"] = date_to
-    if status is not None:
-        q["status"] = status
-
+    q, sort, skip, limit = build_attendance_list_query(
+        emp_code=emp_code,
+        date_from=date_from,
+        date_to=date_to,
+        status=status,
+        page=page,
+        page_size=page_size,
+    )
     total = db.attendance_logs.count_documents(q)
-    skip = (page - 1) * page_size
+    hint = "emp_code_1_date_1" if emp_code else "date_-1_emp_code_1"
     cursor = (
         db.attendance_logs.find(q)
-        .sort([("date", -1), ("emp_code", 1)])
+        .hint(hint)
+        .sort(sort)
         .skip(skip)
-        .limit(page_size)
+        .limit(limit)
     )
     items = [format_attendance_record(d) for d in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
@@ -1052,7 +1077,7 @@ def get_employee_monthly(
     working_days = compute_working_days(month, emp.get("joined_on"))
 
     pipeline = build_employee_monthly_pipeline(emp_code, month)
-    agg_results = list(db.attendance_logs.aggregate(pipeline))
+    agg_results = list(db.attendance_logs.aggregate(pipeline, hint="emp_code_1_date_1"))
 
     if agg_results:
         row = agg_results[0]
@@ -1103,7 +1128,8 @@ def get_department_summary(
         raise HTTPException(status_code=422, detail="Invalid month format")
 
     pipeline = build_department_summary_pipeline(month, department)
-    agg_results = list(db.employees.aggregate(pipeline))
+    hint = "department_1" if department else "joined_on_1"
+    agg_results = list(db.employees.aggregate(pipeline, hint=hint))
 
     items = []
     for doc in agg_results:
@@ -1158,7 +1184,7 @@ def get_late_leaderboard(
         raise HTTPException(status_code=422, detail="Invalid month format")
 
     pipeline = build_late_leaderboard_pipeline(month, limit, department)
-    cursor = db.attendance_logs.aggregate(pipeline)
+    cursor = db.attendance_logs.aggregate(pipeline, hint="date_-1_emp_code_1")
     items = [
         {
             "rank": int(doc["rank"]),
@@ -1202,12 +1228,147 @@ def get_department_trend(
         raise HTTPException(status_code=404, detail="Department not found")
 
     pipeline = build_department_trend_pipeline(department, date_from, date_to)
-    cursor = db.employees.aggregate(pipeline)
+    cursor = db.employees.aggregate(pipeline, hint="department_1")
     items = [format_trend_item(doc) for doc in cursor]
     return {"department": department, "items": items}
 
 
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
+@app.get("/admin/explain/{endpoint}", status_code=200)
+def explain_endpoint(
+    endpoint: Literal[
+        "attendance_list",
+        "employee_monthly",
+        "department_summary",
+        "late_leaderboard",
+        "department_trend",
+    ],
+    emp_code: Optional[str] = None,
+    month: Optional[str] = None,
+    department: Optional[str] = None,
+    limit: Optional[int] = Query(10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
+    trend_from: Optional[str] = Query(None, alias="from"),
+    trend_to: Optional[str] = Query(None, alias="to"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    if month is not None and not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month):
+        raise HTTPException(status_code=422, detail="Invalid month format")
+
+    if endpoint == "attendance_list":
+        q, sort, skip, limit_val = build_attendance_list_query(
+            emp_code=emp_code,
+            date_from=date_from,
+            date_to=date_to,
+            status=status,
+            page=page,
+            page_size=page_size,
+        )
+        hint = "emp_code_1_date_1" if emp_code else "date_-1_emp_code_1"
+        cmd = {
+            "explain": {
+                "find": "attendance_logs",
+                "filter": q,
+                "sort": dict(sort),
+                "skip": skip,
+                "limit": limit_val,
+                "hint": hint,
+            },
+            "verbosity": "executionStats",
+        }
+        collection_name = "attendance_logs"
+
+    elif endpoint == "employee_monthly":
+        if not emp_code or not month:
+            raise HTTPException(status_code=422, detail="emp_code and month are required")
+        pipeline = build_employee_monthly_pipeline(emp_code, month)
+        hint = "emp_code_1_date_1"
+        cmd = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+                "hint": hint,
+            },
+            "verbosity": "executionStats",
+        }
+        collection_name = "attendance_logs"
+
+    elif endpoint == "department_summary":
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required")
+        pipeline = build_department_summary_pipeline(month, department)
+        hint = "department_1" if department else "joined_on_1"
+        cmd = {
+            "explain": {
+                "aggregate": "employees",
+                "pipeline": pipeline,
+                "cursor": {},
+                "hint": hint,
+            },
+            "verbosity": "executionStats",
+        }
+        collection_name = "employees"
+
+    elif endpoint == "late_leaderboard":
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required")
+        pipeline = build_late_leaderboard_pipeline(month, limit or 10, department)
+        hint = "date_-1_emp_code_1"
+        cmd = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+                "hint": hint,
+            },
+            "verbosity": "executionStats",
+        }
+        collection_name = "attendance_logs"
+
+    elif endpoint == "department_trend":
+        if not department or not trend_from or not trend_to:
+            raise HTTPException(
+                status_code=422, detail="department, from, and to are required"
+            )
+        date_regex = r"^\d{4}-\d{2}-\d{2}$"
+        if not re.match(date_regex, trend_from) or not re.match(date_regex, trend_to):
+            raise HTTPException(status_code=422, detail="Invalid date format")
+
+        try:
+            d_from = datetime.strptime(trend_from, "%Y-%m-%d").date()
+            d_to = datetime.strptime(trend_to, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid calendar date")
+
+        if d_to < d_from:
+            raise HTTPException(
+                status_code=422, detail="'to' date must be greater than or equal to 'from' date"
+            )
+
+        num_days = (d_to - d_from).days + 1
+        if num_days > 92:
+            raise HTTPException(status_code=422, detail="Date range cannot exceed 92 days")
+
+        pipeline = build_department_trend_pipeline(department, trend_from, trend_to)
+        hint = "department_1"
+        cmd = {
+            "explain": {
+                "aggregate": "employees",
+                "pipeline": pipeline,
+                "cursor": {},
+                "hint": hint,
+            },
+            "verbosity": "executionStats",
+        }
+        collection_name = "employees"
+
+    raw_explain = db.command(cmd)
+    explain_json = json.loads(json_util.dumps(raw_explain))
+    return {
+        "endpoint": endpoint,
+        "collection": collection_name,
+        "explain": explain_json,
+    }
