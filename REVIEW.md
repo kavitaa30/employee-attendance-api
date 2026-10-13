@@ -1,9 +1,27 @@
 # REVIEW.md
 
-List every defect you found in the starter `app/main.py` (helpers and endpoints). For each one:
+Defects found in the starter `app/main.py`. I found them by running the app in Swagger and calling the helper functions from the terminal, and by reading the code.
 
 | # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
 |---|---|---|---|---|
-| 1 | | | | |
+| 1 | `list_employees`, `skip = page * page_size` | Page 1 skips the first 20 records, so a small collection returns an empty page | `GET /employees?page=1` returned `items: []` with `total: 6` | `skip = (page - 1) * page_size`, and `page` must be at least 1 |
+| 2 | `list_employees`, query and total | `total` counts the whole collection and ignores `department`; no sort order; `page=0` and `page_size=1000` are accepted | Reading the code: `count_documents({})`, `find()` with no `.sort()`, no limits on the parameters | `count_documents(q)`, `.sort("emp_code", 1)`, `page_size` limited to 1..100 with `Query` |
+| 3 | `health()` | Always returns `ok`, it never talks to MongoDB | With MongoDB unreachable it still returned 200 | Ping MongoDB; on failure return 503. The client has `serverSelectionTimeoutMS=2000` so it answers fast |
+| 4 | `compute_late_minutes` | Grace period is checked on whole minutes, so 10 minutes and 1 second counts as 10 and is not late | Shift 09:30, punch-in 09:40:01: returned 0, should be 10 | Decide on seconds: late only if more than 600 seconds, then `late_minutes` is the floor of minutes since shift start |
+| 5 | `compute_work_hours` | Uses Python `round()`, which is banker's rounding | 450 seconds (0.125 hours) returned 0.12, should be 0.13 | Use `Decimal` with `ROUND_HALF_UP` to 2 decimals |
+| 6 | `compute_overtime`, threshold | There is no 30 minute minimum, any extra minute counts as overtime | Shift end 18:30, punch-out 18:45 returned 15, should be 0 | Count overtime only when whole minutes are at least 30 |
+| 7 | `compute_overtime`, datetimes | The shift end is built with a time zone but the punch-out is naive, so the subtraction crashes; for an overnight shift the shift end is put on the wrong day | Called it with a naive datetime: `TypeError: can't subtract offset-naive and offset-aware datetimes` | All datetimes are time zone aware (`tz_aware=True`); for an overnight shift the shift end is on the next day |
+| 8 | Time zones in `punch_in` and the Mongo client | `datetime.now()` is the laptop's local time with no label; PyMongo treats it as UTC, so the stored time is shifted; the attendance date is not the IST date and overnight shifts are ignored (R1) | After a punch-in the stored `punch_in` in MongoDB was 00:28 while the real UTC time was 18:58 | Instants are UTC aware datetimes truncated to seconds; the date is computed in IST with the overnight rule |
+| 9 | `punch_in`, unknown employee | `find_one` returns `None` and the code reads `emp["shift_start"]` | `emp_code: EMP9999` returned 500 | Return 404 when the employee does not exist |
+| 10 | `punch_in`, `status` | Any string is accepted | `status: ABSENT` created a record with a punch-in time | `status` is limited to `PRESENT`, `WFH`, `ON_DUTY`, others give 422 |
+| 11 | `punch_in`, `punched_at` | No validation: a value in seconds is read as milliseconds; `if body.punched_at` treats 0 as missing | `punched_at: 1783312500` gave date `1970-01-21` and `late_minutes: 681` | Strict integer in the range from the contract; floats, strings and booleans give 422; test `is not None` |
+| 12 | Responses of `punch_in` and `list_attendance` | Times are returned as date strings, not epoch milliseconds; Mongo's id is returned as `id`, and microseconds are not truncated | `punch_in` came back as `2026-10-13T00:28:57.074806`, and every record had an `id` | Convert instants to integer epoch milliseconds (whole seconds) and remove `_id` and `id` from responses |
+| 13 | `list_attendance`, validation, sort and legacy records | `page_size` has no maximum; `date_from` greater than `date_to` returns an empty 200; no `emp_code` tie-break in the sort; old records have no `half_day` or `history` | `page_size=500` worked; reversed range gave `items: []`; same-date records were not ordered by `emp_code`; the 2026-07-14 record had no `half_day` or `history` | Validate the parameters (422), sort by date descending then `emp_code` ascending in MongoDB, fill `half_day=false` and `history=[]` for old records |
+| 14 | `list_attendance`, performance | Loads the whole collection into memory and sorts it in Python | Reading the code: `list(db.attendance_logs.find(q))` then `sorted(...)` | Filter, sort, skip and limit are done by MongoDB, with an index on `(date, emp_code)` |
+| 15 | `punch_in` and `create_employee`, duplicates | Check with `find_one` and then `insert_one`: two requests at the same moment can both pass the check; no indexes were created | Reading the code | Unique indexes on `emp_code` and on `(emp_code, date)`, created at startup; `DuplicateKeyError` gives 409 |
+| 16 | `create_employee`, validation | Almost nothing is validated | Reading the code against the contract: no pattern for `emp_code`, no check that `shift_start` differs from `shift_end`, no email or date check, and `created_at` was not epoch milliseconds | `EmployeeIn` validates all fields from the contract, `created_at` is epoch milliseconds |
 
-Also note anything you looked at and decided was **not** a defect, and why.
+## Looked at and decided it is not a defect
+
+- `load_dotenv()` does not override real environment variables (default `override=False`), so the rule "real environment variables must win" already holds. I checked it by starting a second server with `MONGO_URI` set to a wrong port and `/health` returned 503.
+- The `department` filter in `GET /employees` is an exact, case-sensitive match. The contract says the same, so I left it.
