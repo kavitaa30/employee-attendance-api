@@ -1,26 +1,22 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+FastAPI + MongoDB. All application code is in `app/main.py`.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## Run
+    pip install -r requirements.txt
+    export MONGO_URI=mongodb://localhost:27017
+    export MONGO_DB=attendance_db
+    uvicorn app.main:app --port 8000
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+MONGO_URI and MONGO_DB are read from the environment (a local .env is also loaded). Indexes are created at startup.
 
-## Local setup
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
-python sample_seed.py
-uvicorn app.main:app --port 8000 --reload
-```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
+## Notes
+- All endpoints from openapi.yaml are implemented, including the explain endpoint `/admin/explain/{endpoint}`.
+- The analytics endpoints are MongoDB aggregation pipelines.
+- Queries use index hints so the explain output shows IXSCAN; the hints rely on the indexes created at startup.
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+## Known limitations
+- The punch-in race is handled by a unique index and `DuplicateKeyError` (409). I did not run a parallel-request test to confirm it.
+- On a 100k-log dataset, department summary takes about 0.5 s and department trend (91-day range) about 1.3 s. Both use indexes but are not fully optimized.
+- Indexes are created at startup inside a try/except with no retry. If index creation fails, endpoints that use index hints can return 500.
+- The pre-aggregated monthly totals for 100x data are only a design in DECISIONS.md, not implemented.

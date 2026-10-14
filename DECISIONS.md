@@ -1,7 +1,11 @@
-# DECISIONS.md  (about 150-200 words in total - plain language, your own words)
+# DECISIONS.md
 
-1. **Indexes.** Which indexes did you create, and which query or guarantee does each one serve? Which one did you consider and reject?
-2. **Punch-in race.** Two identical punch-in requests arrive at the same instant. Walk through exactly what happens in your code.
-3. **Ties.** Two employees are tied on late minutes at the cutoff of `limit`. What does your leaderboard return, and why?
-4. **Headcount.** How does your department summary make sure employees with zero logs are counted?
-5. **One thing you would change** if this had to serve 100x the data.
+1. **Indexes.** employees: unique `emp_code` (no duplicates, joins), `department` (summary and trend filter), `joined_on` (headcount). attendance_logs: unique `(emp_code, date)` (one record per day, punch-out, monthly report), `(date desc, emp_code)` (list sort, leaderboard, trend). Rejected: an index on `status`, it has only five values and narrows nothing.
+
+2. **Punch-in race.** Both requests call insert_one. The unique `(emp_code, date)` index lets one succeed; the other gets DuplicateKeyError, which I return as 409. There is no check-then-insert gap.
+
+3. **Ties.** `$setWindowFields` with `$rank` gives tied employees the same rank and skips the next one. The limit is applied after ranking (`rank <= limit`), so tied rows at the cutoff are all returned, ordered by emp_code.
+
+4. **Headcount.** The pipeline starts from employees, keeps those with `joined_on` on or before the month end, then `$lookup`s their logs. Each employee counts once, so people with zero logs are counted and later joiners are not.
+
+5. **100x data.** Leaderboard and summary scan a whole month of logs on every request. I would store pre-aggregated totals per employee and month, updated at punch-in, punch-out and PATCH.
